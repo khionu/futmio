@@ -19,5 +19,5 @@ jobs:
         run: cargo doc --no-deps
       - name: Login to Crates.IO
         run: cargo login ${{ secrets.CratesIO }}
-      - name: Publish macros
+      - name: Publish
         run: cargo publish
