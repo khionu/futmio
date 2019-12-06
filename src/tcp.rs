@@ -284,4 +284,40 @@ pub(crate) fn overwrite_waker_prt(cx: &mut Context, ptr: &Arc<Mutex<Option<Waker
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use crate::tcp::TcpListenerStream;
+    use crate::PollBundle;
+    use futures::executor::block_on;
+    use futures::pin_mut;
+    use futures::StreamExt;
+    use std::future::Future;
+    use std::net::{IpAddr, SocketAddr, TcpStream};
+    use std::str::FromStr;
+    use std::task::{Poll, Waker};
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn can_await_connections() {
+        let bundle = PollBundle::new(None, 32).unwrap();
+
+        let bind_addr = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 44444);
+        let mut listener = TcpListenerStream::bind(&bind_addr, &bundle).unwrap();
+
+        let next_conn = listener.next();
+        pin_mut!(next_conn);
+        let mut ctx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+
+        if let Poll::Ready(_) = next_conn.as_mut().poll(&mut ctx) {
+            panic!("Listener should not have a connection yet");
+        }
+
+        TcpStream::connect(&bind_addr).unwrap();
+        // Sleep, so the iteration, ergo waking, is done after we block.
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            bundle.iter()
+        });
+        block_on(next_conn).unwrap();
+    }
+}
