@@ -1,5 +1,8 @@
 [package]
 name = "futmio"
+description = "A thin Futures layer around Mio"
+license = "Apache-2.0 OR MIT"
+keywords = ["async", "futures", "networking", "mio", "events"]
 version = "0.0.1"
 authors = ["Khionu Sybiern <dev@khionu.net>"]
 edition = "2018"
