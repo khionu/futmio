@@ -1,0 +1,23 @@
+name: Cargo Publish
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v1
+      - name: Compile
+        run: cargo build
+      - name: Check formatting
+        run: cargo fmt -- --check
+      - name: Run tests
+        run: cargo test
+      - name: Make sure documentation builds
+        run: cargo doc --no-deps
+      - name: Login to Crates.IO
+        run: cargo login ${{ secrets.CratesIO }}
+      - name: Publish macros
+        run: cargo publish
