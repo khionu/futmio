@@ -78,7 +78,7 @@ impl PollBundle {
             events: Arc::new(Mutex::new(Events::with_capacity(event_buf_size))),
             poll: Arc::new(mio::Poll::new()?),
             timeout: timeout.into(),
-            token_counter: Arc::new(AtomicUsize::new(0)),
+            token_counter: Arc::new(AtomicUsize::new(1)),
             token_freed: Arc::new(Mutex::new(rx)),
             token_drop_box: tx,
             wakers: Default::default(),
@@ -94,7 +94,13 @@ impl PollBundle {
             .expect("Poisoned token channel")
             .try_recv()
         {
-            Err(_) => self.token_counter.fetch_add(1, Ordering::AcqRel),
+            Err(_) => {
+                let val = self.token_counter.fetch_add(1, Ordering::AcqRel);
+                if val == 0 {
+                    panic!("Token Counter overflow. Consider sharding your application");
+                }
+                val
+            }
             Ok(val) => val,
         };
 
