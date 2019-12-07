@@ -6,11 +6,11 @@ use std::{
         mpsc::{Receiver, Sender},
         Arc, Mutex,
     },
-    task::Waker,
     time::Duration,
 };
 
 use futures::io::Error as FutIoError;
+use futures::task::AtomicWaker;
 use log::error;
 use mio::{Evented, Events, PollOpt, Ready, Token as MioToken};
 
@@ -28,7 +28,45 @@ pub struct PollBundle {
     token_counter: Arc<AtomicUsize>,
     token_freed: Arc<Mutex<Receiver<usize>>>,
     token_drop_box: Sender<usize>,
-    wakers: Arc<Mutex<HashMap<usize, Arc<Mutex<Option<Waker>>>>>>,
+    wakers: Arc<Mutex<HashMap<usize, EventedWaker>>>,
+}
+
+pub struct EventedWaker {
+    read: Arc<AtomicWaker>,
+    write: Arc<AtomicWaker>,
+}
+
+impl EventedWaker {
+    pub fn wake(&self, readiness: Ready) {
+        if readiness.contains(Ready::readable()) {
+            self.read.wake();
+        }
+
+        if readiness.contains(Ready::writable()) {
+            self.write.wake();
+        }
+    }
+
+    /// Creates a new [`EventedWaker`]. If passed [`true`], the wakers are separate. If [`false`],
+    /// the wakers are the same.
+    pub fn new(split: bool) -> Self {
+        let read = Arc::new(AtomicWaker::new());
+        let write = if split {
+            Arc::new(Default::default())
+        } else {
+            read.clone()
+        };
+
+        EventedWaker { read, write }
+    }
+
+    pub fn get_read_waker(&self) -> Arc<AtomicWaker> {
+        self.read.clone()
+    }
+
+    pub fn get_write_waker(&self) -> Arc<AtomicWaker> {
+        self.write.clone()
+    }
 }
 
 /// Token returned by the PollBundle on registration. Keep it with the registered handle, drop it
@@ -127,19 +165,7 @@ impl PollBundle {
             // We register the waker at the same time as the token, so this is basically guaranteed
             // to have a value.
             if let Some(waker) = wakers.get(&event.token().0) {
-                match waker.lock() {
-                    // Wakey-wakey!!
-                    Ok(w) => {
-                        // If the Option<Waker> is None, they have yet to poll, and so will be
-                        // polling of their own volition anyways. Ergo, having nothing to notify is
-                        // harmless.
-                        w.as_ref().map(Waker::wake_by_ref);
-                    }
-                    Err(_) => {
-                        // If the Future is poisoned, we don't want to touch that.
-                        error!("Ignoring panicked waker. This should be handled by the future.")
-                    }
-                }
+                waker.wake(event.readiness());
             } else {
                 error!("Registered handler does not have a corresponding Waker. This is a bug.")
             }
@@ -161,7 +187,7 @@ impl PollBundle {
         handle: &E,
         interest: Ready,
         opts: PollOpt,
-        waker_ptr: Arc<Mutex<Option<Waker>>>,
+        wakers: EventedWaker,
     ) -> IoResult<Token>
     where
         E: Evented,
@@ -172,7 +198,7 @@ impl PollBundle {
         self.wakers
             .lock()
             .expect("Poisoned PollBundle")
-            .insert(token.val, waker_ptr);
+            .insert(token.val, wakers);
         Ok(token)
     }
 }

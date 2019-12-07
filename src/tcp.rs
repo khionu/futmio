@@ -1,22 +1,27 @@
-use std::io::{ErrorKind, Read, Result as IoResult, Write};
-use std::net::{Shutdown, SocketAddr};
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::{
+    io::{ErrorKind, Read, Result as IoResult, Write},
+    net::{Shutdown, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
-use futures::{AsyncRead, AsyncWrite, Stream};
-use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
-use mio::{PollOpt, Ready};
+use futures::{task::AtomicWaker, AsyncRead, AsyncWrite, Stream};
+use log::error;
+use mio::{
+    net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream},
+    PollOpt, Ready,
+};
 
-use crate::{FutIoResult, PollBundle, Token};
+use crate::{EventedWaker, FutIoResult, PollBundle, Token};
 
 /// This stream asynchronously yields incoming TCP connections.
 pub struct TcpListenerStream {
     bundle: PollBundle,
     listener: MioTcpListener,
     _token: Token,
-    waker_ptr: Arc<Mutex<Option<Waker>>>,
+    waker_ptr: Arc<AtomicWaker>,
 }
 
 pub struct TcpConnection {
@@ -27,9 +32,9 @@ pub struct TcpConnection {
 impl TcpListenerStream {
     pub fn bind(addr: &SocketAddr, poll_bundle: &PollBundle) -> IoResult<TcpListenerStream> {
         let listener = mio::net::TcpListener::bind(addr)?;
-        let waker_ptr = Arc::new(Mutex::new(None));
-        let token =
-            poll_bundle.register(&listener, Ready::all(), PollOpt::edge(), waker_ptr.clone())?;
+        let waker = EventedWaker::new(false);
+        let waker_ptr = waker.get_read_waker();
+        let token = poll_bundle.register(&listener, Ready::all(), PollOpt::edge(), waker)?;
 
         Ok(TcpListenerStream {
             bundle: poll_bundle.clone(),
@@ -45,7 +50,7 @@ impl Stream for TcpListenerStream {
 
     /// On Err, this returns the error from Mio.
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        overwrite_waker_prt(cx, &self.waker_ptr);
+        self.waker_ptr.register(cx.waker());
 
         match self.listener.accept() {
             // We have a connection!
@@ -77,33 +82,32 @@ impl TcpConnection {
         let TcpConnection { bundle, stream } = self;
         let tx_stream = stream.try_clone()?;
         let rx_stream = stream;
-        let tx_token = bundle.get_token();
-        let rx_token = bundle.get_token();
-        let tx_waker = Arc::new(Mutex::new(None));
-        let rx_waker = Arc::new(Mutex::new(None));
+        let waker = EventedWaker::new(true);
+        let tx_waker = waker.get_write_waker();
+        let rx_waker = waker.get_read_waker();
 
-        bundle.register(
-            &tx_stream,
-            Ready::writable(),
-            PollOpt::edge(),
-            tx_waker.clone(),
-        )?;
-        bundle.register(
-            &rx_stream,
-            Ready::readable(),
-            PollOpt::edge(),
-            rx_waker.clone(),
-        )?;
+        let (tx_token, rx_token) =
+            match bundle.register(&tx_stream, Ready::all(), PollOpt::edge(), waker) {
+                Ok(token) => {
+                    let t = Arc::new(token);
+                    let t2 = t.clone();
+                    (t, t2)
+                }
+                Err(err) => {
+                    error!("Error registering TxStream for split: {}", err);
+                    return Err(err);
+                }
+            };
 
         let tx = TcpSendStream {
             stream: tx_stream,
             _token: tx_token,
-            waker_ptr: Arc::new(Mutex::new(None)),
+            waker_ptr: tx_waker,
         };
         let rx = TcpRecvStream {
             stream: rx_stream,
             _token: rx_token,
-            waker_ptr: Arc::new(Mutex::new(None)),
+            waker_ptr: rx_waker,
         };
         Ok((tx, rx))
     }
@@ -196,14 +200,14 @@ impl TcpConnection {
 
 pub struct TcpRecvStream {
     stream: MioTcpStream,
-    _token: Token,
-    waker_ptr: Arc<Mutex<Option<Waker>>>,
+    _token: Arc<Token>,
+    waker_ptr: Arc<AtomicWaker>,
 }
 
 pub struct TcpSendStream {
     stream: MioTcpStream,
-    _token: Token,
-    waker_ptr: Arc<Mutex<Option<Waker>>>,
+    _token: Arc<Token>,
+    waker_ptr: Arc<AtomicWaker>,
 }
 
 impl AsyncRead for TcpRecvStream {
@@ -212,7 +216,7 @@ impl AsyncRead for TcpRecvStream {
         cx: &mut Context,
         buf: &mut [u8],
     ) -> Poll<FutIoResult<usize>> {
-        overwrite_waker_prt(cx, &self.waker_ptr);
+        self.waker_ptr.register(cx.waker());
 
         match self.stream.read(buf) {
             Ok(len) => Ok(len).into(),
@@ -232,7 +236,7 @@ impl AsyncWrite for TcpSendStream {
         cx: &mut Context,
         buf: &[u8],
     ) -> Poll<FutIoResult<usize>> {
-        overwrite_waker_prt(cx, &self.waker_ptr);
+        self.waker_ptr.register(cx.waker());
 
         match self.stream.write(buf) {
             Ok(len) => Ok(len).into(),
@@ -246,7 +250,7 @@ impl AsyncWrite for TcpSendStream {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<FutIoResult<()>> {
-        overwrite_waker_prt(cx, &self.waker_ptr);
+        self.waker_ptr.register(cx.waker());
 
         match self.stream.flush() {
             Ok(_) => Ok(()).into(),
@@ -260,7 +264,7 @@ impl AsyncWrite for TcpSendStream {
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<FutIoResult<()>> {
-        overwrite_waker_prt(cx, &self.waker_ptr);
+        self.waker_ptr.register(cx.waker());
 
         match self.stream.shutdown(Shutdown::Write) {
             Ok(_) => Ok(()).into(),
@@ -272,15 +276,6 @@ impl AsyncWrite for TcpSendStream {
             err => err.into(),
         }
     }
-}
-
-#[inline]
-pub(crate) fn overwrite_waker_prt(cx: &mut Context, ptr: &Arc<Mutex<Option<Waker>>>) {
-    let mut g = match ptr.lock() {
-        Ok(g) => g,
-        Err(psn) => psn.into_inner(),
-    };
-    *g = Some(cx.waker().clone());
 }
 
 #[cfg(test)]
