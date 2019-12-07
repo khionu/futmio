@@ -80,7 +80,13 @@ impl TcpConnection {
 
     pub fn split(self) -> IoResult<(TcpSendStream, TcpRecvStream)> {
         let TcpConnection { bundle, stream } = self;
-        let tx_stream = stream.try_clone()?;
+        let tx_stream = match stream.try_clone() {
+            Ok(stream) => stream,
+            Err(err) => {
+                error!("Error cloning TcpConnection stream for split: {}", err);
+                return Err(err);
+            }
+        };
         let rx_stream = stream;
         let waker = EventedWaker::new(true);
         let tx_waker = waker.get_write_waker();
