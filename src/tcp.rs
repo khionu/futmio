@@ -296,8 +296,8 @@ mod tests {
     use futures::executor::block_on;
     use futures::StreamExt;
     use futures::{pin_mut, AsyncReadExt, AsyncWriteExt};
-    use mio::net::TcpStream as MioTcpStream;
     use log::*;
+    use mio::net::TcpStream as MioTcpStream;
 
     use crate::tcp::*;
     use crate::tests::init_test_log;
