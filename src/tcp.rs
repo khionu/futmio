@@ -286,20 +286,27 @@ impl AsyncWrite for TcpSendStream {
 
 #[cfg(test)]
 mod tests {
-    use crate::tcp::TcpListenerStream;
-    use crate::PollBundle;
-    use futures::executor::block_on;
-    use futures::pin_mut;
-    use futures::StreamExt;
     use std::future::Future;
-    use std::net::{IpAddr, SocketAddr, TcpStream};
+    use std::net::{IpAddr, SocketAddr};
     use std::str::FromStr;
-    use std::task::{Poll, Waker};
+    use std::task::Poll;
     use std::thread;
     use std::time::Duration;
 
+    use futures::executor::block_on;
+    use futures::StreamExt;
+    use futures::{pin_mut, AsyncReadExt, AsyncWriteExt};
+    use mio::net::TcpStream as MioTcpStream;
+    use log::*;
+
+    use crate::tcp::*;
+    use crate::tests::init_test_log;
+    use crate::PollBundle;
+
     #[test]
     fn can_await_connections() {
+        // Start prep work
+        init_test_log();
         let bundle = PollBundle::new(None, 32).unwrap();
 
         let bind_addr = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 44444);
@@ -308,17 +315,56 @@ mod tests {
         let next_conn = listener.next();
         pin_mut!(next_conn);
         let mut ctx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        // End prep work
 
+        // Ensure that the listener defaults to Pending
         if let Poll::Ready(_) = next_conn.as_mut().poll(&mut ctx) {
             panic!("Listener should not have a connection yet");
         }
 
-        TcpStream::connect(&bind_addr).unwrap();
+        MioTcpStream::connect(&bind_addr).unwrap();
         // Sleep, so the iteration, ergo waking, is done after we block.
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(20));
             bundle.iter()
         });
-        block_on(next_conn).unwrap();
+        block_on(next_conn).unwrap().unwrap();
+    }
+
+    #[test]
+    fn can_await_send_and_recv() {
+        init_test_log();
+        info!("Preparing test");
+        let bundle = PollBundle::new(None, 32).unwrap();
+        let bundle_copy = bundle.clone();
+        let bind_addr = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 44445);
+        info!("Binding TcpListenerStream");
+        let mut listener = TcpListenerStream::bind(&bind_addr, &bundle).unwrap();
+        info!("Starting reactor");
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_millis(20));
+            bundle_copy.iter().unwrap();
+        });
+        info!("Connecting to server");
+        let remote = TcpConnection::connect(&bind_addr, &bundle).unwrap();
+        info!("Splitting remote");
+        let (_, mut remote_rx) = remote.split().unwrap();
+        info!("Blocking on recv connection");
+        let local = block_on(listener.next()).unwrap().unwrap();
+        info!("Splitting local");
+        let (mut local_tx, _) = local.split().unwrap();
+
+        let sample = String::from("This is a test").into_bytes();
+        let mut recv_buffer = Vec::new();
+
+        info!("Blocking on Send");
+        let tx_size = block_on(local_tx.write(sample.as_slice())).unwrap();
+        info!("Blocking on Recv");
+        let rx_size = block_on(remote_rx.read(recv_buffer.as_mut_slice())).unwrap();
+        assert_eq!(tx_size, rx_size, "Bytes sent don't match amount received");
+        assert_eq!(
+            sample, recv_buffer,
+            "Bytes sent are not the same as the bytes received"
+        );
     }
 }
