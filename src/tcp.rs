@@ -8,7 +8,7 @@ use std::{
 };
 
 use futures::{task::AtomicWaker, AsyncRead, AsyncWrite, Stream};
-use log::error;
+use log::{debug, error, trace};
 use mio::{
     net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream},
     PollOpt, Ready,
@@ -27,6 +27,7 @@ pub struct TcpListenerStream {
 pub struct TcpConnection {
     bundle: PollBundle,
     stream: MioTcpStream,
+    token: Token,
 }
 
 impl TcpListenerStream {
@@ -54,7 +55,7 @@ impl Stream for TcpListenerStream {
 
         match self.listener.accept() {
             // We have a connection!
-            Ok(conn) => Some(Ok(TcpConnection::new(conn, &self.bundle))).into(),
+            Ok(conn) => Some(TcpConnection::new(conn, &self.bundle)).into(),
             // We might be polled outside of the Bundle waking us.
             Err(ref err) if err.kind() == ErrorKind::WouldBlock => Poll::Pending,
             // Oops
@@ -64,22 +65,26 @@ impl Stream for TcpListenerStream {
 }
 
 impl TcpConnection {
-    fn new((stream, _): (MioTcpStream, SocketAddr), poll_bundle: &PollBundle) -> Self {
-        Self {
+    fn new((stream, _): (MioTcpStream, SocketAddr), poll_bundle: &PollBundle) -> IoResult<Self> {
+        let waker = EventedWaker::new(false);
+        let token = poll_bundle.register(&stream, Ready::all(), PollOpt::edge(), waker)?;
+
+        Ok(Self {
             bundle: poll_bundle.clone(),
             stream,
-        }
+            token: token,
+        })
     }
 
     pub fn connect(addr: &SocketAddr, poll_bundle: &PollBundle) -> IoResult<Self> {
-        Ok(Self::new(
+        Self::new(
             (MioTcpStream::connect(addr)?, addr.clone()),
             poll_bundle,
-        ))
+        )
     }
 
     pub fn split(self) -> IoResult<(TcpSendStream, TcpRecvStream)> {
-        let TcpConnection { bundle, stream } = self;
+        let TcpConnection { bundle, stream, token } = self;
         let tx_stream = match stream.try_clone() {
             Ok(stream) => stream,
             Err(err) => {
@@ -92,18 +97,11 @@ impl TcpConnection {
         let tx_waker = waker.get_write_waker();
         let rx_waker = waker.get_read_waker();
 
-        let (tx_token, rx_token) =
-            match bundle.register(&tx_stream, Ready::all(), PollOpt::edge(), waker) {
-                Ok(token) => {
-                    let t = Arc::new(token);
-                    let t2 = t.clone();
-                    (t, t2)
-                }
-                Err(err) => {
-                    error!("Error registering TxStream for split: {}", err);
-                    return Err(err);
-                }
-            };
+        let (tx_token, rx_token) = {
+            let t = Arc::new(token);
+            let t2 = t.clone();
+            (t, t2)
+        };
 
         let tx = TcpSendStream {
             stream: tx_stream,
@@ -246,8 +244,12 @@ impl AsyncWrite for TcpSendStream {
 
         match self.stream.write(buf) {
             Ok(len) => Ok(len).into(),
-            Err(ref err) if err.kind() == ErrorKind::WouldBlock => Poll::Pending,
+            Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
+                trace!("Poll write would block, returning pending");
+                Poll::Pending
+            },
             Err(ref err) if err.kind() == ErrorKind::Interrupted => {
+                debug!("Poll write was interrupted, returning pending with immediate wake up");
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
@@ -322,12 +324,12 @@ mod tests {
             panic!("Listener should not have a connection yet");
         }
 
-        MioTcpStream::connect(&bind_addr).unwrap();
         // Sleep, so the iteration, ergo waking, is done after we block.
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(20));
             bundle.iter()
         });
+        MioTcpStream::connect(&bind_addr).unwrap();
         block_on(next_conn).unwrap().unwrap();
     }
 
