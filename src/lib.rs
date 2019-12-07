@@ -111,8 +111,9 @@ impl PollBundle {
         }
     }
 
-    /// If threading in a threadpool or other kind of scheduler, this is the function that should be
-    /// called in a loop. For error details, see [`mio::Poll::poll`].
+    /// Most likely, this crate will be used for creating a custom executor. Said executor should
+    /// have a reactor that runs this function in a loop. For error details, see
+    /// [`mio::Poll::poll`].
     pub fn iter(&self) -> IoResult<()> {
         // Lock on events, for mutable, synchronous execution.
         let events = &mut *self.events.lock().expect("Poisoned PollBundle");
@@ -129,6 +130,9 @@ impl PollBundle {
                 match waker.lock() {
                     // Wakey-wakey!!
                     Ok(w) => {
+                        // If the Option<Waker> is None, they have yet to poll, and so will be
+                        // polling of their own volition anyways. Ergo, having nothing to notify is
+                        // harmless.
                         w.as_ref().map(Waker::wake_by_ref);
                     }
                     Err(_) => {
@@ -143,7 +147,15 @@ impl PollBundle {
         Ok(())
     }
 
-    /// For internal registration of
+    /// Registers a [`mio::Evented`] handle in the wrapped [`mio::Poll`], along with a
+    /// [`std::task::Waker`], allowing an async wrapper of the given handle to be woken. This
+    /// abstracts the [`mio::Poll`] <-> [`mio::Token`] relationship to allow a reactor to wake
+    /// wrapped handlers.
+    ///
+    /// # Panics
+    /// This function may panic if there are more than [`usize`] concurrent handlers registered.
+    /// This is highly unlikely in most practical cases, as process sharding is essentially
+    /// guaranteed to be needed before that number of handlers is reached.
     pub fn register<E: ?Sized>(
         &self,
         handle: &E,
