@@ -73,7 +73,8 @@ impl EventedWaker {
 /// *after* the handle. This ensures that, internally, the corresponding [`mio::Token`] will be
 /// freed when the handle is dropped.
 ///
-/// # Contract: You must keep this Token alive just as long as the [`mio::Evented`] handle.
+/// # Contract
+/// You must keep this Token alive just as long as the [`mio::Evented`] handle.
 pub struct Token {
     val: usize,
     drop_box: Sender<usize>,
@@ -204,4 +205,13 @@ impl PollBundle {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use log::LevelFilter;
+
+    pub fn init_test_log() {
+        let _ = env_logger::builder()
+            .filter_level(LevelFilter::Debug)
+            .is_test(true)
+            .try_init();
+    }
+}
