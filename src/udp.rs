@@ -1,0 +1,281 @@
+use std::{
+    io::{ErrorKind, Read, Result as IoResult, Write},
+    net::{Shutdown, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
+
+use futures::{task::AtomicWaker, AsyncRead, AsyncWrite, Stream};
+use log::{debug, error, trace};
+use mio::net::UdpSocket as MioUdpSocket;
+use mio::Interest;
+
+use crate::{FutIoResult, PollRegistry, SourceWaker, Token};
+
+pub struct UdpSocket {
+    registry: PollRegistry,
+    waker: SourceWaker,
+    socket: MioUdpSocket,
+    token: Token,
+}
+
+const INTEREST_RW: Interest = Interest::READABLE.add(Interest::WRITABLE);
+
+impl UdpSocket {
+    pub fn bind(addr: SocketAddr, poll_registry: &PollRegistry) -> IoResult<Self> {
+        let mut socket = mio::net::UdpSocket::bind(addr)?;
+        let waker = SourceWaker::new();
+        let token = poll_registry.register(&mut socket, INTEREST_RW, waker)?;
+
+        Ok(UdpSocket {
+            registry: poll_registry.try_clone()?,
+            waker,
+            socket,
+            token,
+        })
+    }
+
+    pub fn connect(&self, addr: SocketAddr, poll_registry: &PollRegistry) -> IoResult<()> {
+        MioUdpSocket::connect(&self.socket, addr)
+    }
+
+    pub fn split(self) -> IoResult<(TcpSendStream, TcpRecvStream)> {
+        let TcpConnection {
+            waker,
+            stream,
+            token,
+        } = self;
+
+        let SourceWaker {
+            write: tx_waker,
+            read: rx_waker,
+        } = waker;
+
+        let (tx_stream, rx_stream) = {
+            let s = Arc::new(stream);
+            let s2 = s.clone();
+            (s, s2)
+        };
+
+        let (tx_token, rx_token) = {
+            let t = Arc::new(token);
+            let t2 = t.clone();
+            (t, t2)
+        };
+
+        let tx = TcpSendStream {
+            stream: tx_stream,
+            _token: tx_token,
+            waker_ptr: tx_waker,
+        };
+
+        let rx = TcpRecvStream {
+            stream: rx_stream,
+            _token: rx_token,
+            waker_ptr: rx_waker,
+        };
+        Ok((tx, rx))
+    }
+
+    /// See [`mio::net::TcpStream::peer_addr`] for documentation.
+    pub fn peer_addr(&self) -> IoResult<SocketAddr> {
+        self.stream.peer_addr()
+    }
+
+    /// See [`mio::net::TcpStream::local_addr`] for documentation.
+    pub fn local_addr(&self) -> IoResult<SocketAddr> {
+        self.stream.local_addr()
+    }
+
+    /// See [`mio::net::TcpStream::shutdown`] for documentation.
+    pub fn shutdown(&self, how: Shutdown) -> IoResult<()> {
+        self.stream.shutdown(how)
+    }
+
+    /// See [`mio::net::TcpStream::set_nodelay`] for documentation.
+    pub fn set_nodelay(&self, nodelay: bool) -> IoResult<()> {
+        self.stream.set_nodelay(nodelay)
+    }
+
+    /// See [`mio::net::TcpStream::nodelay`] for documentation.
+    pub fn nodelay(&self) -> IoResult<bool> {
+        self.stream.nodelay()
+    }
+
+    /// See [`mio::net::TcpStream::set_ttl`] for documentation.
+    pub fn set_ttl(&self, ttl: u32) -> IoResult<()> {
+        self.stream.set_ttl(ttl)
+    }
+
+    /// See [`mio::net::TcpStream::ttl`] for documentation.
+    pub fn ttl(&self) -> IoResult<u32> {
+        self.stream.ttl()
+    }
+}
+
+pub struct TcpRecvStream {
+    stream: Arc<MioTcpStream>,
+    _token: Arc<Token>,
+    waker_ptr: Arc<AtomicWaker>,
+}
+
+pub struct TcpSendStream {
+    stream: Arc<MioTcpStream>,
+    _token: Arc<Token>,
+    waker_ptr: Arc<AtomicWaker>,
+}
+
+impl AsyncRead for TcpRecvStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut [u8],
+    ) -> Poll<FutIoResult<usize>> {
+        self.waker_ptr.register(cx.waker());
+
+        match self.stream.as_ref().read(buf) {
+            Ok(len) => Ok(len).into(),
+            Err(ref err) if err.kind() == ErrorKind::WouldBlock => Poll::Pending,
+            Err(ref err) if err.kind() == ErrorKind::Interrupted => {
+                { cx.waker().clone() }.wake();
+                Poll::Pending
+            }
+            err => err.into(),
+        }
+    }
+}
+
+impl AsyncWrite for TcpSendStream {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<FutIoResult<usize>> {
+        self.waker_ptr.register(cx.waker());
+
+        match self.stream.as_ref().write(buf) {
+            Ok(len) => Ok(len).into(),
+            Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
+                trace!("Poll write would block, returning pending");
+                Poll::Pending
+            }
+            Err(ref err) if err.kind() == ErrorKind::Interrupted => {
+                debug!("Poll write was interrupted, returning pending with immediate wake up");
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            err => err.into(),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<FutIoResult<()>> {
+        self.waker_ptr.register(cx.waker());
+
+        match self.stream.as_ref().flush() {
+            Ok(_) => Ok(()).into(),
+            Err(ref err) if err.kind() == ErrorKind::WouldBlock => Poll::Pending,
+            Err(ref err) if err.kind() == ErrorKind::Interrupted => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            err => err.into(),
+        }
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<FutIoResult<()>> {
+        self.waker_ptr.register(cx.waker());
+
+        match self.stream.shutdown(Shutdown::Write) {
+            Ok(_) => Ok(()).into(),
+            Err(ref err) if err.kind() == ErrorKind::WouldBlock => Poll::Pending,
+            Err(ref err) if err.kind() == ErrorKind::Interrupted => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            err => err.into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::net::{IpAddr, SocketAddr};
+    use std::str::FromStr;
+    use std::task::Poll;
+    use std::thread;
+    use std::time::Duration;
+
+    use futures::executor::block_on;
+    use futures::StreamExt;
+    use futures::{pin_mut, AsyncReadExt, AsyncWriteExt};
+    use log::*;
+    use mio::net::TcpStream as MioTcpStream;
+
+    use crate::tcp::*;
+    use crate::tests::init_test_log;
+    use crate::PollDriver;
+
+    #[test]
+    fn can_await_connections() {
+        // Start prep work
+        init_test_log();
+        let (mut driver, registry) = PollDriver::new(None, 32).unwrap();
+
+        let bind_addr = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 44444);
+        let mut listener = TcpListenerStream::bind(bind_addr, &registry).unwrap();
+
+        let next_conn = listener.next();
+        pin_mut!(next_conn);
+        let mut ctx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        // End prep work
+
+        // Ensure that the listener defaults to Pending
+        if let Poll::Ready(_) = next_conn.as_mut().poll(&mut ctx) {
+            panic!("Listener should not have a connection yet");
+        }
+
+        // Sleep, so the iteration, ergo waking, is done after we block.
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            driver.iter()
+        });
+        MioTcpStream::connect(bind_addr).unwrap();
+        block_on(next_conn).unwrap().unwrap();
+    }
+
+    #[test]
+    fn can_await_send_and_recv() {
+        init_test_log();
+        info!("Preparing test");
+        let (mut driver, registry) = PollDriver::new(None, 32).unwrap();
+        let bind_addr = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 44445);
+        info!("Binding TcpListenerStream");
+        let mut listener = TcpListenerStream::bind(bind_addr, &registry).unwrap();
+        info!("Starting reactor");
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_millis(20));
+            driver.iter().unwrap();
+        });
+        info!("Connecting to server");
+        let remote = TcpConnection::connect(bind_addr, &registry).unwrap();
+        info!("Splitting remote");
+        let (_, mut remote_rx) = remote.split().unwrap();
+        info!("Blocking on recv connection");
+        let local = block_on(listener.next()).unwrap().unwrap();
+        info!("Splitting local");
+        let (mut local_tx, _) = local.split().unwrap();
+
+        let sample = String::from("This is a test").into_bytes();
+        let mut recv_buffer = Vec::with_capacity(24);
+
+        info!("Blocking on Send");
+        let tx_size = block_on(local_tx.write(sample.as_slice())).unwrap();
+        block_on(local_tx.flush()).unwrap();
+        info!("Blocking on Recv");
+        let rx_size = block_on(remote_rx.read(&mut recv_buffer)).unwrap();
+        eprintln!("recv_buffer.len(): {}", recv_buffer.len());
+        assert_eq!(tx_size, rx_size, "Bytes sent don't match amount received");
+        assert_eq!(
+            sample, recv_buffer,
+            "Bytes sent are not the same as the bytes received"
+        );
+    }
+}

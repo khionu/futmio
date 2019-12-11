@@ -21,6 +21,7 @@ use std::sync::mpsc::channel;
 type FutIoResult<T> = Result<T, FutIoError>;
 
 pub mod tcp;
+pub mod udp;
 
 pub struct PollDriver {
     events: Events,
