@@ -4,38 +4,40 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
 };
 
 use futures::{task::AtomicWaker, AsyncRead, AsyncWrite, Stream};
 use log::{debug, error, trace};
-use mio::{net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream}};
+use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
+use mio::Interest;
 
-use crate::{SourceWaker, FutIoResult, PollDriver, Token};
+use crate::{FutIoResult, PollRegistry, SourceWaker, Token};
 
 /// This stream asynchronously yields incoming TCP connections.
 pub struct TcpListenerStream {
-    bundle: PollDriver,
+    registry: PollRegistry,
     listener: MioTcpListener,
     _token: Token,
     waker_ptr: Arc<AtomicWaker>,
 }
 
 pub struct TcpConnection {
-    bundle: PollDriver,
+    registry: PollRegistry,
     stream: MioTcpStream,
     token: Token,
 }
 
+const INTEREST_RW: Interest = Interest::READABLE.add(Interest::WRITABLE);
+
 impl TcpListenerStream {
-    pub fn bind(addr: &SocketAddr, poll_bundle: &PollDriver) -> IoResult<TcpListenerStream> {
-        let listener = mio::net::TcpListener::bind(addr)?;
+    pub fn bind(addr: SocketAddr, poll_registry: &PollRegistry) -> IoResult<TcpListenerStream> {
+        let mut listener = mio::net::TcpListener::bind(addr)?;
         let waker = SourceWaker::new(false);
         let waker_ptr = waker.get_read_waker();
-        let token = poll_bundle.register(&listener, Ready::all(), PollOpt::edge(), waker)?;
+        let token = poll_registry.register(&mut listener, INTEREST_RW, waker)?;
 
         Ok(TcpListenerStream {
-            bundle: poll_bundle.clone(),
+            registry: poll_registry.try_clone()?,
             listener,
             _token: token,
             waker_ptr,
@@ -52,7 +54,7 @@ impl Stream for TcpListenerStream {
 
         match self.listener.accept() {
             // We have a connection!
-            Ok(conn) => Some(TcpConnection::new(conn, &self.bundle)).into(),
+            Ok(conn) => Some(TcpConnection::new(conn, &self.registry)).into(),
             // We might be polled outside of the Bundle waking us.
             Err(ref err) if err.kind() == ErrorKind::WouldBlock => Poll::Pending,
             // Oops
@@ -62,35 +64,44 @@ impl Stream for TcpListenerStream {
 }
 
 impl TcpConnection {
-    fn new((stream, _): (MioTcpStream, SocketAddr), poll_bundle: &PollDriver) -> IoResult<Self> {
+    fn new(
+        (mut stream, _): (MioTcpStream, SocketAddr),
+        poll_registry: &PollRegistry,
+    ) -> IoResult<Self> {
         let waker = SourceWaker::new(false);
-        let token = poll_bundle.register(&stream, Ready::all(), PollOpt::edge(), waker)?;
+        let token = poll_registry.register(&mut stream, INTEREST_RW, waker)?;
 
         Ok(Self {
-            bundle: poll_bundle.clone(),
+            registry: poll_registry.try_clone()?,
             stream,
             token: token,
         })
     }
 
-    pub fn connect(addr: &SocketAddr, poll_bundle: &PollDriver) -> IoResult<Self> {
-        Self::new(
-            (MioTcpStream::connect(addr)?, addr.clone()),
-            poll_bundle,
-        )
+    pub fn connect(addr: SocketAddr, poll_registry: &PollRegistry) -> IoResult<Self> {
+        Self::new((MioTcpStream::connect(addr)?, addr.clone()), poll_registry)
     }
 
     pub fn split(self) -> IoResult<(TcpSendStream, TcpRecvStream)> {
-        let TcpConnection { bundle, stream, token } = self;
+        let TcpConnection {
+            registry,
+            mut stream,
+            token,
+        } = self;
+
+        let waker = SourceWaker::new(true);
+        let tx_waker = waker.get_write_waker();
+        let rx_waker = waker.get_read_waker();
+        {
+            // TODO: register both streams separately with their own wakers
+            registry.register(&mut stream, INTEREST_RW, waker)?;
+        }
+
         let (tx_stream, rx_stream) = {
             let s = Arc::new(stream);
             let s2 = s.clone();
             (s, s2)
         };
-
-        let waker = SourceWaker::new(true);
-        let tx_waker = waker.get_write_waker();
-        let rx_waker = waker.get_read_waker();
 
         let (tx_token, rx_token) = {
             let t = Arc::new(token);
@@ -103,6 +114,7 @@ impl TcpConnection {
             _token: tx_token,
             waker_ptr: tx_waker,
         };
+
         let rx = TcpRecvStream {
             stream: rx_stream,
             _token: rx_token,
@@ -136,36 +148,6 @@ impl TcpConnection {
         self.stream.nodelay()
     }
 
-    /// See [`mio::net::TcpStream::set_recv_buffer_size`] for documentation.
-    pub fn set_recv_buffer_size(&self, size: usize) -> IoResult<()> {
-        self.stream.set_recv_buffer_size(size)
-    }
-
-    /// See [`mio::net::TcpStream::recv_buffer_size`] for documentation.
-    pub fn recv_buffer_size(&self) -> IoResult<usize> {
-        self.stream.recv_buffer_size()
-    }
-
-    /// See [`mio::net::TcpStream::set_send_buffer_size`] for documentation.
-    pub fn set_send_buffer_size(&self, size: usize) -> IoResult<()> {
-        self.stream.set_send_buffer_size(size)
-    }
-
-    /// See [`mio::net::TcpStream::send_buffer_size`] for documentation.
-    pub fn send_buffer_size(&self) -> IoResult<usize> {
-        self.stream.send_buffer_size()
-    }
-
-    /// See [`mio::net::TcpStream::set_keepalive`] for documentation.
-    pub fn set_keepalive(&self, keepalive: Option<Duration>) -> IoResult<()> {
-        self.stream.set_keepalive(keepalive)
-    }
-
-    /// See [`mio::net::TcpStream::keepalive`] for documentation.
-    pub fn keepalive(&self) -> IoResult<Option<Duration>> {
-        self.stream.keepalive()
-    }
-
     /// See [`mio::net::TcpStream::set_ttl`] for documentation.
     pub fn set_ttl(&self, ttl: u32) -> IoResult<()> {
         self.stream.set_ttl(ttl)
@@ -174,26 +156,6 @@ impl TcpConnection {
     /// See [`mio::net::TcpStream::ttl`] for documentation.
     pub fn ttl(&self) -> IoResult<u32> {
         self.stream.ttl()
-    }
-
-    /// See [`mio::net::TcpStream::set_only_v6`] for documentation.
-    pub fn set_only_v6(&self, only_v6: bool) -> IoResult<()> {
-        self.stream.set_only_v6(only_v6)
-    }
-
-    /// See [`mio::net::TcpStream::only_v6`] for documentation.
-    pub fn only_v6(&self) -> IoResult<bool> {
-        self.stream.only_v6()
-    }
-
-    /// See [`mio::net::TcpStream::set_linger`] for documentation.
-    pub fn set_linger(&self, dur: Option<Duration>) -> IoResult<()> {
-        self.stream.set_linger(dur)
-    }
-
-    /// See [`mio::net::TcpStream::linger`] for documentation.
-    pub fn linger(&self) -> IoResult<Option<Duration>> {
-        self.stream.linger()
     }
 }
 
@@ -211,13 +173,13 @@ pub struct TcpSendStream {
 
 impl AsyncRead for TcpRecvStream {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context,
         buf: &mut [u8],
     ) -> Poll<FutIoResult<usize>> {
         self.waker_ptr.register(cx.waker());
 
-        match self.stream.read(buf) {
+        match self.stream.as_ref().read(buf) {
             Ok(len) => Ok(len).into(),
             Err(ref err) if err.kind() == ErrorKind::WouldBlock => Poll::Pending,
             Err(ref err) if err.kind() == ErrorKind::Interrupted => {
@@ -230,19 +192,15 @@ impl AsyncRead for TcpRecvStream {
 }
 
 impl AsyncWrite for TcpSendStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context,
-        buf: &[u8],
-    ) -> Poll<FutIoResult<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<FutIoResult<usize>> {
         self.waker_ptr.register(cx.waker());
 
-        match self.stream.write(buf) {
+        match self.stream.as_ref().write(buf) {
             Ok(len) => Ok(len).into(),
             Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
                 trace!("Poll write would block, returning pending");
                 Poll::Pending
-            },
+            }
             Err(ref err) if err.kind() == ErrorKind::Interrupted => {
                 debug!("Poll write was interrupted, returning pending with immediate wake up");
                 cx.waker().wake_by_ref();
@@ -252,10 +210,10 @@ impl AsyncWrite for TcpSendStream {
         }
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<FutIoResult<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<FutIoResult<()>> {
         self.waker_ptr.register(cx.waker());
 
-        match self.stream.flush() {
+        match self.stream.as_ref().flush() {
             Ok(_) => Ok(()).into(),
             Err(ref err) if err.kind() == ErrorKind::WouldBlock => Poll::Pending,
             Err(ref err) if err.kind() == ErrorKind::Interrupted => {
@@ -304,10 +262,10 @@ mod tests {
     fn can_await_connections() {
         // Start prep work
         init_test_log();
-        let bundle = PollDriver::new(None, 32).unwrap();
+        let (mut driver, registry) = PollDriver::new(None, 32).unwrap();
 
         let bind_addr = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 44444);
-        let mut listener = TcpListenerStream::bind(&bind_addr, &bundle).unwrap();
+        let mut listener = TcpListenerStream::bind(bind_addr, &registry).unwrap();
 
         let next_conn = listener.next();
         pin_mut!(next_conn);
@@ -322,9 +280,9 @@ mod tests {
         // Sleep, so the iteration, ergo waking, is done after we block.
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(20));
-            bundle.iter()
+            driver.iter()
         });
-        MioTcpStream::connect(&bind_addr).unwrap();
+        MioTcpStream::connect(bind_addr).unwrap();
         block_on(next_conn).unwrap().unwrap();
     }
 
@@ -332,18 +290,17 @@ mod tests {
     fn can_await_send_and_recv() {
         init_test_log();
         info!("Preparing test");
-        let bundle = PollDriver::new(None, 32).unwrap();
-        let bundle_copy = bundle.clone();
+        let (mut driver, registry) = PollDriver::new(None, 32).unwrap();
         let bind_addr = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 44445);
         info!("Binding TcpListenerStream");
-        let mut listener = TcpListenerStream::bind(&bind_addr, &bundle).unwrap();
+        let mut listener = TcpListenerStream::bind(bind_addr, &registry).unwrap();
         info!("Starting reactor");
         thread::spawn(move || loop {
             thread::sleep(Duration::from_millis(20));
-            bundle_copy.iter().unwrap();
+            driver.iter().unwrap();
         });
         info!("Connecting to server");
-        let remote = TcpConnection::connect(&bind_addr, &bundle).unwrap();
+        let remote = TcpConnection::connect(bind_addr, &registry).unwrap();
         info!("Splitting remote");
         let (_, mut remote_rx) = remote.split().unwrap();
         info!("Blocking on recv connection");
