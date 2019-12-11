@@ -9,31 +9,28 @@ use std::{
 
 use futures::{task::AtomicWaker, AsyncRead, AsyncWrite, Stream};
 use log::{debug, error, trace};
-use mio::{
-    net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream},
-    PollOpt, Ready,
-};
+use mio::{net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream}};
 
-use crate::{EventedWaker, FutIoResult, PollBundle, Token};
+use crate::{SourceWaker, FutIoResult, PollDriver, Token};
 
 /// This stream asynchronously yields incoming TCP connections.
 pub struct TcpListenerStream {
-    bundle: PollBundle,
+    bundle: PollDriver,
     listener: MioTcpListener,
     _token: Token,
     waker_ptr: Arc<AtomicWaker>,
 }
 
 pub struct TcpConnection {
-    bundle: PollBundle,
+    bundle: PollDriver,
     stream: MioTcpStream,
     token: Token,
 }
 
 impl TcpListenerStream {
-    pub fn bind(addr: &SocketAddr, poll_bundle: &PollBundle) -> IoResult<TcpListenerStream> {
+    pub fn bind(addr: &SocketAddr, poll_bundle: &PollDriver) -> IoResult<TcpListenerStream> {
         let listener = mio::net::TcpListener::bind(addr)?;
-        let waker = EventedWaker::new(false);
+        let waker = SourceWaker::new(false);
         let waker_ptr = waker.get_read_waker();
         let token = poll_bundle.register(&listener, Ready::all(), PollOpt::edge(), waker)?;
 
@@ -65,8 +62,8 @@ impl Stream for TcpListenerStream {
 }
 
 impl TcpConnection {
-    fn new((stream, _): (MioTcpStream, SocketAddr), poll_bundle: &PollBundle) -> IoResult<Self> {
-        let waker = EventedWaker::new(false);
+    fn new((stream, _): (MioTcpStream, SocketAddr), poll_bundle: &PollDriver) -> IoResult<Self> {
+        let waker = SourceWaker::new(false);
         let token = poll_bundle.register(&stream, Ready::all(), PollOpt::edge(), waker)?;
 
         Ok(Self {
@@ -76,7 +73,7 @@ impl TcpConnection {
         })
     }
 
-    pub fn connect(addr: &SocketAddr, poll_bundle: &PollBundle) -> IoResult<Self> {
+    pub fn connect(addr: &SocketAddr, poll_bundle: &PollDriver) -> IoResult<Self> {
         Self::new(
             (MioTcpStream::connect(addr)?, addr.clone()),
             poll_bundle,
@@ -85,15 +82,13 @@ impl TcpConnection {
 
     pub fn split(self) -> IoResult<(TcpSendStream, TcpRecvStream)> {
         let TcpConnection { bundle, stream, token } = self;
-        let tx_stream = match stream.try_clone() {
-            Ok(stream) => stream,
-            Err(err) => {
-                error!("Error cloning TcpConnection stream for split: {}", err);
-                return Err(err);
-            }
+        let (tx_stream, rx_stream) = {
+            let s = Arc::new(stream);
+            let s2 = s.clone();
+            (s, s2)
         };
-        let rx_stream = stream;
-        let waker = EventedWaker::new(true);
+
+        let waker = SourceWaker::new(true);
         let tx_waker = waker.get_write_waker();
         let rx_waker = waker.get_read_waker();
 
@@ -203,13 +198,13 @@ impl TcpConnection {
 }
 
 pub struct TcpRecvStream {
-    stream: MioTcpStream,
+    stream: Arc<MioTcpStream>,
     _token: Arc<Token>,
     waker_ptr: Arc<AtomicWaker>,
 }
 
 pub struct TcpSendStream {
-    stream: MioTcpStream,
+    stream: Arc<MioTcpStream>,
     _token: Arc<Token>,
     waker_ptr: Arc<AtomicWaker>,
 }
@@ -303,13 +298,13 @@ mod tests {
 
     use crate::tcp::*;
     use crate::tests::init_test_log;
-    use crate::PollBundle;
+    use crate::PollDriver;
 
     #[test]
     fn can_await_connections() {
         // Start prep work
         init_test_log();
-        let bundle = PollBundle::new(None, 32).unwrap();
+        let bundle = PollDriver::new(None, 32).unwrap();
 
         let bind_addr = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 44444);
         let mut listener = TcpListenerStream::bind(&bind_addr, &bundle).unwrap();
@@ -337,7 +332,7 @@ mod tests {
     fn can_await_send_and_recv() {
         init_test_log();
         info!("Preparing test");
-        let bundle = PollBundle::new(None, 32).unwrap();
+        let bundle = PollDriver::new(None, 32).unwrap();
         let bundle_copy = bundle.clone();
         let bind_addr = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 44445);
         info!("Binding TcpListenerStream");

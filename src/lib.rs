@@ -12,42 +12,48 @@ use std::{
 use futures::io::Error as FutIoError;
 use futures::task::AtomicWaker;
 use log::error;
-use mio::{Evented, Events, PollOpt, Ready, Token as MioToken};
+use mio::{event::{Event, Events, Source}, PollOpt, Interest, Token as MioToken, Registry, Poll};
+use std::sync::mpsc::channel;
 
 type FutIoResult<T> = Result<T, FutIoError>;
 
 pub mod tcp;
 
-#[derive(Clone)]
-pub struct PollBundle {
-    events: Arc<Mutex<Events>>,
-    poll: Arc<mio::Poll>,
+pub struct PollDriver {
+    events: Events,
+    poll: mio::Poll,
     timeout: Option<Duration>,
+    wakers: Arc<Mutex<HashMap<usize, SourceWaker>>>,
+}
+
+#[derive(Clone)]
+pub struct PollRegistry {
+    mio_registry: Registry,
     // We use an atomic counter to ensure a unique backing value per Token. usize should be large
     // enough.
     token_counter: Arc<AtomicUsize>,
     token_freed: Arc<Mutex<Receiver<usize>>>,
     token_drop_box: Sender<usize>,
-    wakers: Arc<Mutex<HashMap<usize, EventedWaker>>>,
+    wakers: Arc<Mutex<HashMap<usize, SourceWaker>>>,
 }
 
-pub struct EventedWaker {
+pub struct SourceWaker {
     read: Arc<AtomicWaker>,
     write: Arc<AtomicWaker>,
 }
 
-impl EventedWaker {
-    pub fn wake(&self, readiness: Ready) {
-        if readiness.contains(Ready::readable()) {
+impl SourceWaker {
+    pub fn wake(&self, interest: Interest) {
+        if interest.is_writable() {
             self.read.wake();
         }
 
-        if readiness.contains(Ready::writable()) {
+        if interest.is_readable() {
             self.write.wake();
         }
     }
 
-    /// Creates a new [`EventedWaker`]. If passed [`true`], the wakers are separate. If [`false`],
+    /// Creates a new [`SourceWaker`]. If passed [`true`], the wakers are separate. If [`false`],
     /// the wakers are the same.
     pub fn new(split: bool) -> Self {
         let read = Arc::new(AtomicWaker::new());
@@ -57,7 +63,7 @@ impl EventedWaker {
             read.clone()
         };
 
-        EventedWaker { read, write }
+        SourceWaker { read, write }
     }
 
     pub fn get_read_waker(&self) -> Arc<AtomicWaker> {
@@ -74,15 +80,16 @@ impl EventedWaker {
 /// freed when the handle is dropped.
 ///
 /// # Contract
-/// You must keep this Token alive just as long as the [`mio::Evented`] handle.
+/// You must keep this Token alive just as long as the [`mio::event::Source`] handle.
 pub struct Token {
     val: usize,
     drop_box: Sender<usize>,
-    bundle: PollBundle,
+    bundle: PollRegistry,
 }
 
 impl Token {
-    pub fn get_mio(&self) -> MioToken {
+    /// Generates a [`mio::Token`]
+    pub(crate) fn get_mio(&self) -> MioToken {
         MioToken(self.val)
     }
 }
@@ -107,62 +114,43 @@ impl Drop for Token {
     }
 }
 
-impl PollBundle {
+impl PollDriver {
     pub fn new(
         timeout: impl Into<Option<Duration>>,
         event_buf_size: usize,
-    ) -> IoResult<PollBundle> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        Ok(PollBundle {
-            events: Arc::new(Mutex::new(Events::with_capacity(event_buf_size))),
-            poll: Arc::new(mio::Poll::new()?),
+    ) -> IoResult<(PollDriver, PollRegistry)> {
+        let poll = Poll::new()?;
+        let registry = poll.registry().try_clone()?;
+        let wakers = Arc::new(Mutex::new(Default::default()));
+        let (tx, rx) = channel();
+
+        let driver = PollDriver {
+            events: Events::with_capacity(event_buf_size),
+            poll,
             timeout: timeout.into(),
+            wakers: wakers.clone(),
+        };
+        let registry = PollRegistry {
+            mio_registry: registry,
             token_counter: Arc::new(AtomicUsize::new(1)),
             token_freed: Arc::new(Mutex::new(rx)),
             token_drop_box: tx,
-            wakers: Default::default(),
-        })
-    }
-
-    fn get_token(&self) -> Token {
-        // First we check the inbox for a freed token. If we have one, reuse it. However, most
-        // likely we won't, so we catch the error and just get a fresh value.
-        let val = match self
-            .token_freed
-            .lock()
-            .expect("Poisoned token channel")
-            .try_recv()
-        {
-            Err(_) => {
-                let val = self.token_counter.fetch_add(1, Ordering::AcqRel);
-                if val == 0 {
-                    panic!("Token Counter overflow. Consider sharding your application");
-                }
-                val
-            }
-            Ok(val) => val,
+            wakers
         };
-
-        Token {
-            val,
-            drop_box: self.token_drop_box.clone(),
-            bundle: self.clone(),
-        }
+        Ok((driver, registry))
     }
 
     /// Most likely, this crate will be used for creating a custom executor. Said executor should
-    /// have a reactor that runs this function in a loop. For error details, see
-    /// [`mio::Poll::poll`].
-    pub fn iter(&self) -> IoResult<()> {
+    /// have a reactor that runs this in a loop. For error details, see [`mio::Poll::poll`].
+    pub fn iter(&mut self) -> IoResult<()> {
         // Lock on events, for mutable, synchronous execution.
-        let events = &mut *self.events.lock().expect("Poisoned PollBundle");
         // Do the poll
-        self.poll.poll(events, self.timeout)?;
+        self.poll.poll(&mut self.events, self.timeout)?;
 
         // We lock on this *now* because we want minimal contention with Futures updating their
         // wakers.
-        let wakers = self.wakers.lock().expect("Poisoned PollBundle");
-        for event in events.iter() {
+        let wakers = self.wakers.lock().expect("Poisoned waker store");
+        for event in self.events.iter() {
             // We register the waker at the same time as the token, so this is basically guaranteed
             // to have a value.
             if let Some(waker) = wakers.get(&event.token().0) {
@@ -183,24 +171,50 @@ impl PollBundle {
     /// This function may panic if there are more than [`usize`] concurrent handlers registered.
     /// This is highly unlikely in most practical cases, as process sharding is essentially
     /// guaranteed to be needed before that number of handlers is reached.
-    pub fn register<E: ?Sized>(
+
+}
+
+impl PollRegistry {
+    pub fn register<S: Source + ?Sized>(
         &self,
-        handle: &E,
-        interest: Ready,
-        opts: PollOpt,
-        wakers: EventedWaker,
+        handle: &S,
+        interest: Interest,
+        wakers: SourceWaker,
     ) -> IoResult<Token>
-    where
-        E: Evented,
     {
         let token = self.get_token();
-        self.poll
-            .register(handle, token.get_mio(), interest, opts)?;
+        self.mio_registry.register(handle, token.get_mio(), interest)?;
         self.wakers
             .lock()
             .expect("Poisoned PollBundle")
             .insert(token.val, wakers);
         Ok(token)
+    }
+
+    fn get_token(&self) -> Token {
+        // First we check the inbox for a freed token. If we have one, reuse it. However, most
+        // likely we won't, so we catch the error and just get a fresh value.
+        let val = match self
+            .token_freed
+            .lock()
+            .expect("Poisoned token channel")
+            .try_recv()
+            {
+                Err(_) => {
+                    let val = self.token_counter.fetch_add(1, Ordering::AcqRel);
+                    if val == 0 {
+                        panic!("Token Counter overflow. Consider sharding your application");
+                    }
+                    val
+                }
+                Ok(val) => val,
+            };
+
+        Token {
+            val,
+            drop_box: self.token_drop_box.clone(),
+            bundle: self.clone(),
+        }
     }
 }
 
@@ -210,7 +224,7 @@ mod tests {
 
     pub fn init_test_log() {
         let _ = env_logger::builder()
-            .filter_level(LevelFilter::Debug)
+            .filter_level(LevelFilter::Trace)
             .is_test(true)
             .try_init();
     }
