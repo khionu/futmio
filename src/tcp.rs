@@ -316,7 +316,8 @@ mod tests {
         eprintln!("recv_buffer.len(): {}", recv_buffer.len());
         assert_eq!(tx_size, rx_size, "Bytes sent don't match amount received");
         assert_eq!(
-            sample.as_slice(), &recv_buffer[..14],
+            sample.as_slice(),
+            &recv_buffer[..14],
             "Bytes sent are not the same as the bytes received"
         );
     }
