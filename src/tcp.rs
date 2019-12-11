@@ -32,7 +32,7 @@ const INTEREST_RW: Interest = Interest::READABLE.add(Interest::WRITABLE);
 impl TcpListenerStream {
     pub fn bind(addr: SocketAddr, poll_registry: &PollRegistry) -> IoResult<TcpListenerStream> {
         let mut listener = mio::net::TcpListener::bind(addr)?;
-        let waker = SourceWaker::new(false);
+        let waker = SourceWaker::new();
         let waker_ptr = waker.get_read_waker();
         let token = poll_registry.register(&mut listener, INTEREST_RW, waker)?;
 
@@ -68,7 +68,7 @@ impl TcpConnection {
         (mut stream, _): (MioTcpStream, SocketAddr),
         poll_registry: &PollRegistry,
     ) -> IoResult<Self> {
-        let waker = SourceWaker::new(false);
+        let waker = SourceWaker::new();
         let token = poll_registry.register(&mut stream, INTEREST_RW, waker.clone())?;
 
         Ok(Self {
@@ -310,6 +310,7 @@ mod tests {
 
         info!("Blocking on Send");
         let tx_size = block_on(local_tx.write(sample.as_slice())).unwrap();
+        block_on(local_tx.flush()).unwrap();
         info!("Blocking on Recv");
         let rx_size = block_on(remote_rx.read(&mut recv_buffer)).unwrap();
         eprintln!("recv_buffer.len(): {}", recv_buffer.len());

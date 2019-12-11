@@ -70,13 +70,9 @@ impl SourceWaker {
 
     /// Creates a new [`SourceWaker`]. If passed [`true`], the wakers are separate. If [`false`],
     /// the wakers are the same.
-    pub fn new(split: bool) -> Self {
-        let read = Arc::new(AtomicWaker::new());
-        let write = if split {
-            Arc::new(Default::default())
-        } else {
-            read.clone()
-        };
+    pub fn new() -> Self {
+        let read = Arc::new(Default::default());
+        let write = Arc::new(Default::default());
 
         SourceWaker { read, write }
     }
