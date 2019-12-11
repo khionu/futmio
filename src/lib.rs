@@ -51,31 +51,28 @@ impl PollRegistry {
     }
 }
 
+#[derive(Clone)]
 pub struct SourceWaker {
-    read: Arc<AtomicWaker>,
-    write: Arc<AtomicWaker>,
+    pub(crate) read: Arc<AtomicWaker>,
+    pub(crate) write: Arc<AtomicWaker>,
 }
 
 impl SourceWaker {
     pub fn wake(&self, event: &Event) {
         if event.is_writable() {
-            self.read.wake();
+            self.write.wake();
         }
 
         if event.is_readable() {
-            self.write.wake();
+            self.read.wake();
         }
     }
 
     /// Creates a new [`SourceWaker`]. If passed [`true`], the wakers are separate. If [`false`],
     /// the wakers are the same.
-    pub fn new(split: bool) -> Self {
-        let read = Arc::new(AtomicWaker::new());
-        let write = if split {
-            Arc::new(Default::default())
-        } else {
-            read.clone()
-        };
+    pub fn new() -> Self {
+        let read = Arc::new(Default::default());
+        let write = Arc::new(Default::default());
 
         SourceWaker { read, write }
     }
@@ -98,7 +95,7 @@ impl SourceWaker {
 pub struct Token {
     val: usize,
     drop_box: Sender<usize>,
-    bundle: PollRegistry,
+    registry: PollRegistry,
 }
 
 impl Token {
@@ -123,7 +120,7 @@ impl PartialEq<Token> for MioToken {
 impl Drop for Token {
     fn drop(&mut self) {
         // We don't care if it fails. We just need to try if it is possible.
-        let _ = self.bundle.wakers.lock().map(|mut g| g.remove(&self.val));
+        let _ = self.registry.wakers.lock().map(|mut g| g.remove(&self.val));
         let _ = self.drop_box.send(self.val);
     }
 }
@@ -200,7 +197,7 @@ impl PollRegistry {
             .register(handle, token.get_mio(), interest)?;
         self.wakers
             .lock()
-            .expect("Poisoned PollBundle")
+            .expect("Poisoned PollRegistry")
             .insert(token.val, wakers);
         Ok(token)
     }
@@ -227,7 +224,7 @@ impl PollRegistry {
         Ok(Token {
             val,
             drop_box: self.token_drop_box.clone(),
-            bundle: self.try_clone()?,
+            registry: self.try_clone()?,
         })
     }
 }

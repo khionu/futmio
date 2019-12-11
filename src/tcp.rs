@@ -22,7 +22,7 @@ pub struct TcpListenerStream {
 }
 
 pub struct TcpConnection {
-    registry: PollRegistry,
+    waker: SourceWaker,
     stream: MioTcpStream,
     token: Token,
 }
@@ -32,7 +32,7 @@ const INTEREST_RW: Interest = Interest::READABLE.add(Interest::WRITABLE);
 impl TcpListenerStream {
     pub fn bind(addr: SocketAddr, poll_registry: &PollRegistry) -> IoResult<TcpListenerStream> {
         let mut listener = mio::net::TcpListener::bind(addr)?;
-        let waker = SourceWaker::new(false);
+        let waker = SourceWaker::new();
         let waker_ptr = waker.get_read_waker();
         let token = poll_registry.register(&mut listener, INTEREST_RW, waker)?;
 
@@ -68,11 +68,11 @@ impl TcpConnection {
         (mut stream, _): (MioTcpStream, SocketAddr),
         poll_registry: &PollRegistry,
     ) -> IoResult<Self> {
-        let waker = SourceWaker::new(false);
-        let token = poll_registry.register(&mut stream, INTEREST_RW, waker)?;
+        let waker = SourceWaker::new();
+        let token = poll_registry.register(&mut stream, INTEREST_RW, waker.clone())?;
 
         Ok(Self {
-            registry: poll_registry.try_clone()?,
+            waker,
             stream,
             token: token,
         })
@@ -84,18 +84,15 @@ impl TcpConnection {
 
     pub fn split(self) -> IoResult<(TcpSendStream, TcpRecvStream)> {
         let TcpConnection {
-            registry,
-            mut stream,
+            waker,
+            stream,
             token,
         } = self;
 
-        let waker = SourceWaker::new(true);
-        let tx_waker = waker.get_write_waker();
-        let rx_waker = waker.get_read_waker();
-        {
-            // TODO: register both streams separately with their own wakers
-            registry.register(&mut stream, INTEREST_RW, waker)?;
-        }
+        let SourceWaker {
+            write: tx_waker,
+            read: rx_waker,
+        } = waker;
 
         let (tx_stream, rx_stream) = {
             let s = Arc::new(stream);
@@ -309,12 +306,14 @@ mod tests {
         let (mut local_tx, _) = local.split().unwrap();
 
         let sample = String::from("This is a test").into_bytes();
-        let mut recv_buffer = Vec::new();
+        let mut recv_buffer = Vec::with_capacity(24);
 
         info!("Blocking on Send");
         let tx_size = block_on(local_tx.write(sample.as_slice())).unwrap();
+        block_on(local_tx.flush()).unwrap();
         info!("Blocking on Recv");
-        let rx_size = block_on(remote_rx.read(recv_buffer.as_mut_slice())).unwrap();
+        let rx_size = block_on(remote_rx.read(&mut recv_buffer)).unwrap();
+        eprintln!("recv_buffer.len(): {}", recv_buffer.len());
         assert_eq!(tx_size, rx_size, "Bytes sent don't match amount received");
         assert_eq!(
             sample, recv_buffer,
