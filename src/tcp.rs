@@ -7,7 +7,11 @@ use std::{
 };
 
 use futures::{task::AtomicWaker, AsyncRead, AsyncWrite, Stream};
+<<<<<<< HEAD
 use log::{debug, error, trace};
+=======
+use log::{debug, trace};
+>>>>>>> master
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
 use mio::Interest;
 
@@ -306,7 +310,7 @@ mod tests {
         let (mut local_tx, _) = local.split().unwrap();
 
         let sample = String::from("This is a test").into_bytes();
-        let mut recv_buffer = Vec::with_capacity(24);
+        let mut recv_buffer = [0; 24];
 
         info!("Blocking on Send");
         let tx_size = block_on(local_tx.write(sample.as_slice())).unwrap();
@@ -316,7 +320,8 @@ mod tests {
         eprintln!("recv_buffer.len(): {}", recv_buffer.len());
         assert_eq!(tx_size, rx_size, "Bytes sent don't match amount received");
         assert_eq!(
-            sample, recv_buffer,
+            sample.as_slice(),
+            &recv_buffer[..14],
             "Bytes sent are not the same as the bytes received"
         );
     }
