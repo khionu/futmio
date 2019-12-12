@@ -12,7 +12,10 @@ use std::{
 use futures::io::Error as FutIoError;
 use futures::task::AtomicWaker;
 use log::error;
-use mio::{event::{Event, Events, Source}, PollOpt, Interest, Token as MioToken, Registry, Poll};
+use mio::{
+    event::{Event, Events, Source},
+    Interest, Poll, Registry, Token as MioToken,
+};
 use std::sync::mpsc::channel;
 
 type FutIoResult<T> = Result<T, FutIoError>;
@@ -26,7 +29,6 @@ pub struct PollDriver {
     wakers: Arc<Mutex<HashMap<usize, SourceWaker>>>,
 }
 
-#[derive(Clone)]
 pub struct PollRegistry {
     mio_registry: Registry,
     // We use an atomic counter to ensure a unique backing value per Token. usize should be large
@@ -37,31 +39,40 @@ pub struct PollRegistry {
     wakers: Arc<Mutex<HashMap<usize, SourceWaker>>>,
 }
 
+impl PollRegistry {
+    pub fn try_clone(&self) -> IoResult<Self> {
+        Ok(Self {
+            mio_registry: self.mio_registry.try_clone()?,
+            token_counter: self.token_counter.clone(),
+            token_freed: self.token_freed.clone(),
+            token_drop_box: self.token_drop_box.clone(),
+            wakers: self.wakers.clone(),
+        })
+    }
+}
+
+#[derive(Clone)]
 pub struct SourceWaker {
-    read: Arc<AtomicWaker>,
-    write: Arc<AtomicWaker>,
+    pub(crate) read: Arc<AtomicWaker>,
+    pub(crate) write: Arc<AtomicWaker>,
 }
 
 impl SourceWaker {
-    pub fn wake(&self, interest: Interest) {
-        if interest.is_writable() {
-            self.read.wake();
+    pub fn wake(&self, event: &Event) {
+        if event.is_writable() {
+            self.write.wake();
         }
 
-        if interest.is_readable() {
-            self.write.wake();
+        if event.is_readable() {
+            self.read.wake();
         }
     }
 
     /// Creates a new [`SourceWaker`]. If passed [`true`], the wakers are separate. If [`false`],
     /// the wakers are the same.
-    pub fn new(split: bool) -> Self {
-        let read = Arc::new(AtomicWaker::new());
-        let write = if split {
-            Arc::new(Default::default())
-        } else {
-            read.clone()
-        };
+    pub fn new() -> Self {
+        let read = Arc::new(Default::default());
+        let write = Arc::new(Default::default());
 
         SourceWaker { read, write }
     }
@@ -84,7 +95,7 @@ impl SourceWaker {
 pub struct Token {
     val: usize,
     drop_box: Sender<usize>,
-    bundle: PollRegistry,
+    registry: PollRegistry,
 }
 
 impl Token {
@@ -109,7 +120,7 @@ impl PartialEq<Token> for MioToken {
 impl Drop for Token {
     fn drop(&mut self) {
         // We don't care if it fails. We just need to try if it is possible.
-        let _ = self.bundle.wakers.lock().map(|mut g| g.remove(&self.val));
+        let _ = self.registry.wakers.lock().map(|mut g| g.remove(&self.val));
         let _ = self.drop_box.send(self.val);
     }
 }
@@ -135,7 +146,7 @@ impl PollDriver {
             token_counter: Arc::new(AtomicUsize::new(1)),
             token_freed: Arc::new(Mutex::new(rx)),
             token_drop_box: tx,
-            wakers
+            wakers,
         };
         Ok((driver, registry))
     }
@@ -154,14 +165,14 @@ impl PollDriver {
             // We register the waker at the same time as the token, so this is basically guaranteed
             // to have a value.
             if let Some(waker) = wakers.get(&event.token().0) {
-                waker.wake(event.readiness());
+                waker.wake(event);
             } else {
                 error!("Registered handler does not have a corresponding Waker. This is a bug.")
             }
         }
         Ok(())
     }
-
+    /*
     /// Registers a [`mio::Evented`] handle in the wrapped [`mio::Poll`], along with a
     /// [`std::task::Waker`], allowing an async wrapper of the given handle to be woken. This
     /// abstracts the [`mio::Poll`] <-> [`mio::Token`] relationship to allow a reactor to wake
@@ -171,27 +182,27 @@ impl PollDriver {
     /// This function may panic if there are more than [`usize`] concurrent handlers registered.
     /// This is highly unlikely in most practical cases, as process sharding is essentially
     /// guaranteed to be needed before that number of handlers is reached.
-
+     */
 }
 
 impl PollRegistry {
     pub fn register<S: Source + ?Sized>(
         &self,
-        handle: &S,
+        handle: &mut S,
         interest: Interest,
         wakers: SourceWaker,
-    ) -> IoResult<Token>
-    {
-        let token = self.get_token();
-        self.mio_registry.register(handle, token.get_mio(), interest)?;
+    ) -> IoResult<Token> {
+        let token = self.get_token()?;
+        self.mio_registry
+            .register(handle, token.get_mio(), interest)?;
         self.wakers
             .lock()
-            .expect("Poisoned PollBundle")
+            .expect("Poisoned PollRegistry")
             .insert(token.val, wakers);
         Ok(token)
     }
 
-    fn get_token(&self) -> Token {
+    fn get_token(&self) -> IoResult<Token> {
         // First we check the inbox for a freed token. If we have one, reuse it. However, most
         // likely we won't, so we catch the error and just get a fresh value.
         let val = match self
@@ -199,22 +210,22 @@ impl PollRegistry {
             .lock()
             .expect("Poisoned token channel")
             .try_recv()
-            {
-                Err(_) => {
-                    let val = self.token_counter.fetch_add(1, Ordering::AcqRel);
-                    if val == 0 {
-                        panic!("Token Counter overflow. Consider sharding your application");
-                    }
-                    val
+        {
+            Err(_) => {
+                let val = self.token_counter.fetch_add(1, Ordering::AcqRel);
+                if val == 0 {
+                    panic!("Token Counter overflow. Consider sharding your application");
                 }
-                Ok(val) => val,
-            };
+                val
+            }
+            Ok(val) => val,
+        };
 
-        Token {
+        Ok(Token {
             val,
             drop_box: self.token_drop_box.clone(),
-            bundle: self.clone(),
-        }
+            registry: self.try_clone()?,
+        })
     }
 }
 
