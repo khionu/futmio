@@ -13,7 +13,7 @@ use mio::Interest;
 
 use crate::{FutIoResult, PollRegistry, SourceWaker, Token};
 
-/// This stream asynchronously yields incoming TCP connections.
+/// The concept of "server" in TCP, this stream asynchronously yields inbound [`TcpConnection`]s.
 pub struct TcpListenerStream {
     registry: PollRegistry,
     listener: MioTcpListener,
@@ -21,6 +21,7 @@ pub struct TcpListenerStream {
     waker_ptr: Arc<AtomicWaker>,
 }
 
+/// One half of a TCP connection. Configure, then use [`TcpConnection::split`] to consume.
 pub struct TcpConnection {
     waker: SourceWaker,
     stream: MioTcpStream,
@@ -30,6 +31,7 @@ pub struct TcpConnection {
 const INTEREST_RW: Interest = Interest::READABLE.add(Interest::WRITABLE);
 
 impl TcpListenerStream {
+    /// Binds to the given [`SocketAddr`], returning a new [`TcpListenerStream`] for that address.
     pub fn bind(addr: SocketAddr, poll_registry: &PollRegistry) -> IoResult<TcpListenerStream> {
         let mut listener = mio::net::TcpListener::bind(addr)?;
         let waker = SourceWaker::new();

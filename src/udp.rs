@@ -6,7 +6,6 @@ use std::{
 };
 
 use futures::future::poll_fn;
-use log::{debug, trace};
 use mio::net::UdpSocket as MioUdpSocket;
 use mio::Interest;
 

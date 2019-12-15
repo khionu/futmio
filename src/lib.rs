@@ -23,6 +23,8 @@ type FutIoResult<T> = Result<T, FutIoError>;
 pub mod tcp;
 pub mod udp;
 
+/// The driving pressure for events. Assuming a custom executor, this will be moved into a reactor
+/// that calls [`PollDriver::iter`]
 pub struct PollDriver {
     events: Events,
     poll: mio::Poll,
@@ -127,6 +129,9 @@ impl Drop for Token {
 }
 
 impl PollDriver {
+    /// Creates a new [`PollDriver`] and corresponding [`PollRegistry`]. The registry should be
+    /// passed around to register [`mio::events::Source`]s, while the driver will be used from
+    /// within a reactor to keep pressure in the polled events.
     pub fn new(
         timeout: impl Into<Option<Duration>>,
         event_buf_size: usize,
@@ -173,7 +178,9 @@ impl PollDriver {
         }
         Ok(())
     }
-    /*
+}
+
+impl PollRegistry {
     /// Registers a [`mio::Evented`] handle in the wrapped [`mio::Poll`], along with a
     /// [`std::task::Waker`], allowing an async wrapper of the given handle to be woken. This
     /// abstracts the [`mio::Poll`] <-> [`mio::Token`] relationship to allow a reactor to wake
@@ -183,10 +190,6 @@ impl PollDriver {
     /// This function may panic if there are more than [`usize`] concurrent handlers registered.
     /// This is highly unlikely in most practical cases, as process sharding is essentially
     /// guaranteed to be needed before that number of handlers is reached.
-     */
-}
-
-impl PollRegistry {
     pub fn register<S: Source + ?Sized>(
         &self,
         handle: &mut S,
@@ -203,6 +206,7 @@ impl PollRegistry {
         Ok(token)
     }
 
+    /// Attempts to get a recycled token, otherwise generates a fresh one.
     fn get_token(&self) -> IoResult<Token> {
         // First we check the inbox for a freed token. If we have one, reuse it. However, most
         // likely we won't, so we catch the error and just get a fresh value.
