@@ -237,11 +237,27 @@ impl PollRegistry {
 #[cfg(test)]
 mod tests {
     use log::LevelFilter;
+    use std::io::Result as IoResult;
+
+    use crate::PollDriver;
 
     pub fn init_test_log() {
         let _ = env_logger::builder()
             .filter_level(LevelFilter::Trace)
             .is_test(true)
             .try_init();
+    }
+
+    #[test]
+    fn recycle_token() -> IoResult<()> {
+        let (driver, registry) = PollDriver::new(None, 0)?;
+        let t1 = registry.get_token()?;
+        let t2 = registry.get_token()?;
+        assert_eq!(t1.val, 1_usize, "First token was not 1");
+        assert_eq!(t2.val, 2_usize, "Second token was not 2");
+        drop(t1);
+        let t3 = registry.get_token()?;
+        assert_eq!(t3.val, 1_usize, "Third token was not 1");
+        Ok(())
     }
 }

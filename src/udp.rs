@@ -200,9 +200,9 @@ mod tests {
         let (mut driver, registry) = PollDriver::new(None, 32).unwrap();
 
         info!("Binding UdpSockets");
-        let bind_addr = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 44445);
+        let bind_addr = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 44446);
         let local = UdpSocket::bind(bind_addr, &registry).unwrap();
-        let bind_addr2 = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 44446);
+        let bind_addr2 = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 44447);
         let remote = UdpSocket::bind(bind_addr2, &registry).unwrap();
         remote.connect(bind_addr).unwrap();
 
@@ -236,9 +236,9 @@ mod tests {
 
         info!("Binding UdpSockets");
 
-        let bind_addr = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 44445);
+        let bind_addr = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 44448);
         let local = UdpSocket::bind(bind_addr, &registry).unwrap();
-        let bind_addr2 = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 44446);
+        let bind_addr2 = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 44449);
         let remote = UdpSocket::bind(bind_addr2, &registry).unwrap();
 
         info!("Starting reactor");
