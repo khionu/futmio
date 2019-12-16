@@ -261,7 +261,7 @@ mod tests {
     fn can_await_connections() {
         // Start prep work
         init_test_log();
-        let (mut driver, registry) = PollDriver::new(None, 32).unwrap();
+        let (mut driver, registry) = PollDriver::new(Duration::from_millis(100), 32).unwrap();
 
         let bind_addr = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 44444);
         let mut listener = TcpListenerStream::bind(bind_addr, &registry).unwrap();
@@ -278,10 +278,13 @@ mod tests {
 
         // Sleep, so the iteration, ergo waking, is done after we block.
         thread::spawn(move || {
-            thread::sleep(Duration::from_millis(20));
-            driver.iter()
+            // Loop just in case we miss it.
+            loop {
+                thread::sleep(Duration::from_millis(20));
+                driver.iter().unwrap();
+            }
         });
-        MioTcpStream::connect(bind_addr).unwrap();
+        let _remote = MioTcpStream::connect(bind_addr).unwrap();
         block_on(next_conn).unwrap().unwrap();
     }
 

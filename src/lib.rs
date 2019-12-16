@@ -250,13 +250,18 @@ mod tests {
 
     #[test]
     fn recycle_token() -> IoResult<()> {
-        let (driver, registry) = PollDriver::new(None, 0)?;
+        let (_driver, registry) = PollDriver::new(None, 0)?;
         let t1 = registry.get_token()?;
         let t2 = registry.get_token()?;
+
+        // Should start at 1 because 0 is reserved by Mio
         assert_eq!(t1.val, 1_usize, "First token was not 1");
         assert_eq!(t2.val, 2_usize, "Second token was not 2");
+
+        // Drop should return the token to the registry
         drop(t1);
         let t3 = registry.get_token()?;
+
         assert_eq!(t3.val, 1_usize, "Third token was not 1");
         Ok(())
     }
