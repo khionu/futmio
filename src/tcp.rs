@@ -6,10 +6,10 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::{task::AtomicWaker, AsyncRead, AsyncWrite, Stream};
+use futures::{AsyncRead, AsyncWrite, Stream, task::AtomicWaker};
 use log::{debug, trace};
-use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
 use mio::Interest;
+use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
 
 use crate::{FutIoResult, PollRegistry, SourceWaker, Token};
 
@@ -247,15 +247,15 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use futures::{AsyncReadExt, AsyncWriteExt, pin_mut};
     use futures::executor::block_on;
     use futures::StreamExt;
-    use futures::{pin_mut, AsyncReadExt, AsyncWriteExt};
     use log::*;
     use mio::net::TcpStream as MioTcpStream;
 
+    use crate::PollDriver;
     use crate::tcp::*;
     use crate::tests::init_test_log;
-    use crate::PollDriver;
 
     #[test]
     fn can_await_connections() {

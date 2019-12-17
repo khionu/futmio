@@ -2,12 +2,13 @@ use std::{
     collections::HashMap,
     io::Result as IoResult,
     sync::{
+        Arc,
         atomic::{AtomicUsize, Ordering},
-        mpsc::{Receiver, Sender},
-        Arc, Mutex,
+        mpsc::{Receiver, Sender}, Mutex,
     },
     time::Duration,
 };
+use std::sync::mpsc::channel;
 
 use futures::io::Error as FutIoError;
 use futures::task::AtomicWaker;
@@ -16,7 +17,6 @@ use mio::{
     event::{Event, Events, Source},
     Interest, Poll, Registry, Token as MioToken,
 };
-use std::sync::mpsc::channel;
 
 type FutIoResult<T> = Result<T, FutIoError>;
 
@@ -236,8 +236,9 @@ impl PollRegistry {
 
 #[cfg(test)]
 mod tests {
-    use log::LevelFilter;
     use std::io::Result as IoResult;
+
+    use log::LevelFilter;
 
     use crate::PollDriver;
 

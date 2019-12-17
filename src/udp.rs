@@ -6,8 +6,8 @@ use std::{
 };
 
 use futures::future::poll_fn;
-use mio::net::UdpSocket as MioUdpSocket;
 use mio::Interest;
+use mio::net::UdpSocket as MioUdpSocket;
 
 use crate::{FutIoResult, PollRegistry, SourceWaker, Token};
 
@@ -189,9 +189,9 @@ mod tests {
     use futures::executor::block_on;
     use log::*;
 
+    use crate::PollDriver;
     use crate::tests::init_test_log;
     use crate::udp::*;
-    use crate::PollDriver;
 
     #[test]
     fn can_await_send_and_recv() {
