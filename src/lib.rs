@@ -23,6 +23,8 @@ type FutIoResult<T> = Result<T, FutIoError>;
 pub mod tcp;
 pub mod udp;
 
+const INTEREST_RW: Interest = Interest::READABLE.add(Interest::WRITABLE);
+
 /// The driving pressure for events. Assuming a custom executor, this will be moved into a reactor
 /// that calls [`PollDriver::iter`]
 pub struct PollDriver {

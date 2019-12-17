@@ -8,10 +8,9 @@ use std::{
 
 use futures::{AsyncRead, AsyncWrite, Stream, task::AtomicWaker};
 use log::{debug, trace};
-use mio::Interest;
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
 
-use crate::{FutIoResult, PollRegistry, SourceWaker, Token};
+use crate::{FutIoResult, PollRegistry, SourceWaker, Token, INTEREST_RW};
 
 /// The concept of "server" in TCP, this stream asynchronously yields inbound [`TcpConnection`]s.
 pub struct TcpListenerStream {
@@ -27,8 +26,6 @@ pub struct TcpConnection {
     stream: MioTcpStream,
     token: Token,
 }
-
-const INTEREST_RW: Interest = Interest::READABLE.add(Interest::WRITABLE);
 
 impl TcpListenerStream {
     /// Binds to the given [`SocketAddr`], returning a new [`TcpListenerStream`] for that address.

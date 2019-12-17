@@ -6,10 +6,9 @@ use std::{
 };
 
 use futures::future::poll_fn;
-use mio::Interest;
 use mio::net::UdpSocket as MioUdpSocket;
 
-use crate::{FutIoResult, PollRegistry, SourceWaker, Token};
+use crate::{FutIoResult, PollRegistry, SourceWaker, Token, INTEREST_RW};
 
 #[derive(Clone)]
 pub struct UdpSocket {
@@ -17,8 +16,6 @@ pub struct UdpSocket {
     socket: Arc<MioUdpSocket>,
     token: Arc<Token>,
 }
-
-const INTEREST_RW: Interest = Interest::READABLE.add(Interest::WRITABLE);
 
 impl UdpSocket {
     pub fn bind(addr: SocketAddr, poll_registry: &PollRegistry) -> IoResult<Self> {
